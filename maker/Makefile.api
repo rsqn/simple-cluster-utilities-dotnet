@@ -1,0 +1,160 @@
+
+.PHONY:  % # Make all targets phony
+.EXPORT_ALL_VARIABLES:
+default: build
+
+BUILD_CONFIGURATION:=release
+SERVICE_NAME := _SLN_NAME_
+SOLUTION := _SLN_NAME_.sln
+PROJECTS := _SLN_NAME_.Api _SLN_NAME_.Api.Tests
+BRANCH_NAME ?= $(shell git branch --show-current)
+
+DOCKER_IMAGE_NAME := _SLN_NAME_.webapi
+DOCKER_HUB_DOCKER_REPO := bellfg/_SLN_NAME_.webapi
+DOCKER_REPO := $(DOCKER_HUB_DOCKER_REPO)
+DOCKER_TAG := $(shell cat VERSION) # call version.patch before to update this
+
+COVERAGE_THRESHOLD := 0
+COVERAGE_REPORT := coverage.cobertura.xml
+SERVICE_PORT := 80
+HOST_PORT := 5055
+
+###############################
+# SETUP TARGETS
+###############################
+
+ifeq ($(OS),Windows_NT)
+	INSO:=inso.exe
+else
+	INSO:=./inso
+endif
+
+setup.windows:	
+	@echo run install-inso-ps1
+	.\install-inso.ps1
+	
+setup.linux:
+	# Note that this won't work inside WSL or docker due to networking (until I make it work)
+	rm -f inso*.tar.xz
+	rm -rf inso
+	wget https://github.com/Kong/insomnia/releases/download/core%409.3.3/inso-linux-9.3.3.tar.xz
+	tar -xf inso-linux-9.3.3.tar.xz
+	./inso --version
+	rm -f inso*.tar.xz
+
+setup: cdk.setup sonar.setup
+
+cdk.setup:
+	npm install -g aws-cdk
+	
+sonar.setup:
+	dotnet tool install --global dotnet-sonarscanner
+	
+# ifeq ($(OS),Windows_NT)
+# 	make setup.windows
+# else
+# 	make setup.linux
+# endif	
+
+###############################
+# UTILITY
+###############################
+
+shell.container: 
+	docker run  -it --entrypoint /bin/bash $(DOCKER_IMAGE_NAME)
+	#docker run  -it --entrypoint /bin/bash bellfg/_SLN_NAME_.webapi:0.0.20
+
+
+run.container: 
+	docker run -t -e "ASPNETCORE_ENVIRONMENT=uat"  -p $(HOST_PORT):$(SERVICE_PORT) -e "ASPNETCORE_ENVIRONMENT=Development" $(DOCKER_IMAGE_NAME)
+
+###############################
+# BUILD TARGETS
+###############################
+
+version.patch:
+	@echo $(shell echo $(shell cat VERSION) | awk -F. '{$$3=$$3+1; print $$1"."$$2"."$$3}') > VERSION
+	@echo $(shell cat VERSION)
+
+clean:
+	rm -rf inso
+	rm -rf inso.exe
+	rm -rf .sonarqube
+	#find . -type d \( -name bin -o -name obj -o -name TestResults \) -exec rm -rf {} +
+	find . -type d \( -name obj -o -name TestResults \) -exec rm -rf {} +
+	make -C cdk clean 
+	dotnet nuget locals all --clear
+
+reset: clean
+	make -C cdk reset 
+
+install:
+	dotnet restore $(SOLUTION)
+	
+build: install
+	dotnet build $(SOLUTION)
+
+test: build
+	dotnet test $(SOLUTION)  --collect "Code coverage" --collect:"XPlat Code Coverage" /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura /p:Threshold=$(COVERAGE_THRESHOLD) --logger "trx;LogFileName=test_results.trx"
+
+acceptance.test: 
+	$(INSO) --verbose --exportFile insomnia/export.yaml run test NegativeSanityTestSuite --env LOCAL --disableCertValidation --reporter list  --keepFile
+
+package: build
+	dotnet publish -c Release
+	docker build -t $(DOCKER_IMAGE_NAME) -f Dockerfile .
+
+sonarcloud:
+	dotnet sonarscanner begin /o:"bell-financial-group" /k:"Bell-Financial_$(SERVICE_NAME)" /d:sonar.host.url="https://sonarcloud.io" /d:sonar.token="4588e9a7f77f14fcdd4ce83c09ef91aa2750b359" /d:sonar.branch.name=$(BRANCH_NAME) 
+	dotnet build
+	dotnet test $(SOLUTION) --collect "Code coverage" --collect:"XPlat Code Coverage" /p:CoverletOutputFormat=cobertura /p:CollectCoverage=true
+	dotnet sonarscanner end /d:sonar.token="4588e9a7f77f14fcdd4ce83c09ef91aa2750b359"
+
+###############################
+# DEPLOY_TARGETS
+###############################
+
+publish: package
+	docker tag $(DOCKER_IMAGE_NAME):latest $(DOCKER_REPO):$(DOCKER_TAG)
+	docker push $(DOCKER_REPO):$(DOCKER_TAG)
+	docker tag  $(DOCKER_REPO):$(DOCKER_TAG) $(DOCKER_REPO):latest
+	docker push $(DOCKER_REPO):latest
+
+cdk.install:
+	make -C cdk install 
+
+cdk.synth: cdk.install
+	make -C cdk synth
+
+deploy.app:	
+	make -C cdk deploy.app 
+
+deploy.infra:	
+	make -C cdk deploy.infra 
+
+deploy:	
+	make -C cdk deploy 	
+
+deploy.ci:
+	make -C cdk deploy.ci	
+
+destroy.app:
+	make -C cdk destroy.app 
+
+destroy.infra:
+	make -C cdk destroy.infra 
+
+destroy:
+	make -C cdk destroy 	
+
+prepare.env.shared-dev:
+	make -C cdk prepare.env.shared-dev
+
+prepare.env.shared-uat:
+	make -C cdk prepare.env.shared-uat
+
+prepare.env.shared-stg:
+	make -C cdk prepare.env.shared-stg
+
+prepare.env.shared-prd:
+	make -C cdk prepare.env.shared-prd		
